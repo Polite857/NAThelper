@@ -1,0 +1,2 @@
+# NAThelper
+支持WindowsNT4.0/Windows95的NAT穿透软件，可以让有NAT1但没有公网IP（路由器WAN口显示内网IP）的用户在公网地址上打洞，从而让BT高速下载或开放服务变得可能
