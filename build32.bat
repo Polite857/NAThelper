@@ -11,7 +11,7 @@ setlocal enableextensions
 set "HERE=%~dp0"
 set "ROOT=%HERE%.."
 set "GCC=%ROOT%\toolchain\w64devkit\bin\i686-w64-mingw32-gcc.exe"
-set "SRC=%HERE%NAThelper.c"
+set "SRC=%HERE%NAThelp32.c"
 set "EXE=%HERE%NAThelp32.exe"
 set "OBJ=%HERE%NAThelp32.o"
 
@@ -26,7 +26,9 @@ set "TMP=%HERE%_build\tmp"
 set "TEMP=%TMP%"
 
 set "CFLAGS=-O2 -Wall -Wextra -Wno-unused-parameter -std=gnu99"
-set "CFLAGS=%CFLAGS% -DNATHELPER_LEGACY=1 -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0400 -DWINVER=0x0400"
+rem NAThelp32.c 是 32 位专用源文件（含 NT4 兼容层，不含 9x 的 ANSI 层），
+rem 不需要任何平台 -D，也不含条件编译。
+set "CFLAGS=%CFLAGS% -DUNICODE -D_UNICODE"
 set "CFLAGS=%CFLAGS% -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE"
 
 rem subsystem 4.0: NT4 loader only accepts <= 4.0; newer systems still run it.

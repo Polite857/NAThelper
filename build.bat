@@ -29,7 +29,9 @@ set "TMP=%HERE%_build\tmp"
 set "TEMP=%TMP%"
 
 set "CFLAGS=-O2 -Wall -Wextra -Wno-unused-parameter -std=gnu99"
-set "CFLAGS=%CFLAGS% -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0600 -DWINVER=0x0600"
+rem NAThelper.c 是 64 位专用源文件（Vista x64+），不含任何兼容层，
+rem 也不需要平台 -D。
+set "CFLAGS=%CFLAGS% -DUNICODE -D_UNICODE"
 set "CFLAGS=%CFLAGS% -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE"
 
 set "LDFLAGS=-mwindows -s -Wl,--major-subsystem-version,6,--minor-subsystem-version,0"

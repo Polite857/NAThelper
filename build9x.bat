@@ -11,7 +11,7 @@ setlocal enableextensions
 set "HERE=%~dp0"
 set "ROOT=%HERE%.."
 set "GCC=%ROOT%\toolchain\w64devkit\bin\i686-w64-mingw32-gcc.exe"
-set "SRC=%HERE%NAThelper.c"
+set "SRC=%HERE%NAThelp9X.c"
 set "EXE=%HERE%NAThelp9X.exe"
 set "OBJ=%HERE%NAThelp9X.o"
 
@@ -26,8 +26,9 @@ set "TMP=%HERE%_build\tmp"
 set "TEMP=%TMP%"
 
 set "CFLAGS=-O2 -Wall -Wextra -Wno-unused-parameter -std=gnu99"
-set "CFLAGS=%CFLAGS% -DNATHELPER_LEGACY=1 -DNATHELPER_ANSI=1 -DUNICODE -D_UNICODE"
-set "CFLAGS=%CFLAGS% -D_WIN32_WINNT=0x0400 -DWINVER=0x0400"
+rem NAThelp9X.c 是 9x 专用源文件（NT4 兼容层 + 全 ANSI 界面层），
+rem 不需要任何平台 -D，也不含条件编译。
+set "CFLAGS=%CFLAGS% -DUNICODE -D_UNICODE"
 set "CFLAGS=%CFLAGS% -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE"
 
 rem subsystem 4.0: 95/98/Me loader accepts only <= 4.0 (same as NT4).

@@ -1,13 +1,13 @@
 /*
- * NAThelper - NAT 穿透端口映射助手（三个构建共用这一份源码）
+ * NAThelper - NAT 穿透端口映射助手（64 位构建）
  *
- * 目标平台: 64 位  NAThelper   Windows Vista SP2 x64 及以上   build.bat
- *           32 位  NAThelp32   Windows NT 4.0 SP5+ 32 位全部   build32.bat
- *           9x     NAThelp9X   Windows 95 / 98 / Me            build9x.bat
+ * 本文件: NAThelper.c   （独立维护；改功能时 NAThelp32.c / NAThelp9X.c 也要同步）
+ * 目标  : Windows Vista SP2 x64 及以上
+ * 构建  : build.bat  ->  NAThelper.exe
  *
- * 9x 构建的特殊性：95/98/Me 的 user32/kernel32/gdi32/comctl32 没有任何 *W
- * 入口点，所以用 -DNATHELPER_ANSI=1 编译：界面 API 全部走 ANSI，程序内部
- * 仍然使用 UTF-16，只在进出系统 API 的边界按 ACP（中文 Windows = GBK）转码。
+ * 本文件只服务 Vista x64 及以上：直接调用 Vista 之后的 API，
+ * 没有任何 NT4 / 9x 兼容代码（那份代码只存在于 NAThelp32.c / NAThelp9X.c）。
+ *
  * 编译工具: w64devkit / MinGW-w64 GCC
  *
  * 工作方式:
@@ -28,11 +28,22 @@
  *      映射租期 3600 秒，每 25 分钟自动续约，停止时删除映射。
  *   6. 黑名单：按 IPv4 网段、前缀（113.75.*.*）、起止地址或 CIDR
  *      屏蔽来源。TCP 在 accept 后立刻回 RST，UDP 在新建会话前直接丢弃。
- *      只在新连接建立时查一次表，已建立的连接不再检查，避免逐包开销。
+ *      平时只查新连接；一条规则刚建立时会先扫一次连接表，把命中的已建立
+ *      连接立刻 RST，然后回落到只查新连接。
+ *   7. BT 反吸血（全局开关）：同一个 IP 只要同时保持 2 条及以上入站连接
+ *      （换源端口、连不同映射端口都算），就自动把这个 IP 加入黑名单（备注
+ *      "BT反吸血程序封禁"），并把它已经建立的连接立刻 RST 掉。
  *
  * 说明: 本程序不做 NAT 类型检测。仅适用于映射行为与过滤行为
  *       均为 EndpointIndependent 的无公网 IP 用户。
  */
+
+/* ================================================================== */
+/* 构建目标：64 位（Windows Vista SP2 x64 及以上）。                   */
+/* 本文件不含 NT4 / 9x 兼容代码，不需要任何平台开关。                 */
+/* ================================================================== */
+#define _WIN32_WINNT       0x0600
+#define WINVER             0x0600
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -47,26 +58,6 @@
 #define FD_SETSIZE 256
 #endif
 
-/* 32 位兼容构建（Windows NT4 SP5 及以上 32 位系统，直到 Windows 11 x86）：
-   用 -DNATHELPER_LEGACY=1 -D_WIN32_WINNT=0x0400 编译。该构建不引用任何
-   NT4 之后才出现的 API，才能被 NT4 的加载器接受；64 位构建保持原样。 */
-#if (defined(NATHELPER_LEGACY) && NATHELPER_LEGACY) || \
-    (defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0500)
-#  define NAT_LEGACY 1
-#else
-#  define NAT_LEGACY 0
-#endif
-
-/* Windows 95/98/Me 构建：这三个系统的 kernel32/user32/gdi32/comctl32 只有
-   ANSI 版本，CreateWindowExW 这一整套入口点根本不存在，静态引用会让 exe
-   在 9x 上加载失败（"无法定位程序输入点 ... 于 USER32.dll"）。
-   用 -DNATHELPER_ANSI=1 编译时，内部仍全部是 UTF-16 字符串，只在进出系统
-   API 的边界按系统 ANSI 代码页（中文 Windows = GBK）转码，见下面的兼容层。 */
-#if defined(NATHELPER_ANSI) && NATHELPER_ANSI
-#  define NAT_ANSI 1
-#else
-#  define NAT_ANSI 0
-#endif
 
 /* LVS_EX_DOUBLEBUFFER 是 comctl32 6.0 才有的扩展样式；老系统会忽略
    未知位，但编译期必须有定义。 */
@@ -78,9 +69,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <commctrl.h>
-#if !NAT_LEGACY
 #include <iphlpapi.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -95,432 +84,16 @@
 #endif
 
 /* ------------------------------------------------------------------ */
-/* ANSI 兼容层（Windows 95/98/Me 构建专用）                            */
-/* ------------------------------------------------------------------ */
-/* 9x 的 kernel32/user32/gdi32/comctl32 只有 ANSI 版本：CreateWindowExW
-   这一整套入口点根本不存在，静态引用会让 exe 在 9x 上加载失败（"无法定位
-   程序输入点 ... 于 USER32.dll"）。这里把源码里的 W 入口在编译期重定向到
-   下面的包装：内部仍是 UTF-16，只在进出系统 API 的边界按 ACP（中文 Windows
-   = GBK）转码。NT4/64 位构建完全不经过这些代码。 */
 
-#if NAT_ANSI
-
-#define NAT_ABUF 8192
-
-static void NatWtoA(const WCHAR *src, char *dst, int cap)
-{
-    if (dst == NULL || cap <= 0)
-        return;
-    if (src == NULL) {
-        dst[0] = '\0';
-        return;
-    }
-    if (WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, NULL, NULL) <= 0)
-        dst[0] = '\0';
-}
-
-static void NatAtoW(const char *src, WCHAR *dst, int cch)
-{
-    if (dst == NULL || cch <= 0)
-        return;
-    if (src == NULL) {
-        dst[0] = L'\0';
-        return;
-    }
-    if (MultiByteToWideChar(CP_ACP, 0, src, -1, dst, cch) <= 0)
-        dst[0] = L'\0';
-}
-
-static BOOL NatSetWindowText(HWND hwnd, const WCHAR *text)
-{
-    char buf[NAT_ABUF];
-
-    NatWtoA(text, buf, NAT_ABUF);
-    return SetWindowTextA(hwnd, buf);
-}
-
-static int NatGetWindowText(HWND hwnd, WCHAR *text, int cch)
-{
-    char buf[NAT_ABUF];
-
-    buf[0] = '\0';
-    GetWindowTextA(hwnd, buf, NAT_ABUF);
-    NatAtoW(buf, text, cch);
-    return (int)wcslen(text);
-}
-
-static int NatGetWindowTextLength(HWND hwnd)
-{
-    return GetWindowTextLengthA(hwnd);
-}
-
-static int NatMessageBox(HWND hwnd, const WCHAR *text, const WCHAR *caption,
-                         UINT type)
-{
-    char t[NAT_ABUF];
-    char c[256];
-
-    NatWtoA(text, t, NAT_ABUF);
-    NatWtoA(caption, c, sizeof(c));
-    return MessageBoxA(hwnd, t, c, type);
-}
-
-static HWND NatCreateWindowEx(DWORD exStyle, const WCHAR *className,
-                              const WCHAR *text, DWORD style, int x, int y,
-                              int w, int h, HWND parent, HMENU menu,
-                              HINSTANCE inst, void *param)
-{
-    char cls[128];
-
-    NatWtoA(className, cls, sizeof(cls));
-    if (text != NULL) {
-        char txt[NAT_ABUF];
-
-        NatWtoA(text, txt, NAT_ABUF);
-        return CreateWindowExA(exStyle, cls, txt, style, x, y, w, h,
-                               parent, menu, inst, param);
-    }
-    return CreateWindowExA(exStyle, cls, NULL, style, x, y, w, h,
-                           parent, menu, inst, param);
-}
-
-static ATOM NatRegisterClassEx(const WNDCLASSEXW *wc)
-{
-    WNDCLASSEXA a;
-    char cls[128];
-    char menu[128];
-
-    ZeroMemory(&a, sizeof(a));
-    a.cbSize = sizeof(a);
-    a.style = wc->style;
-    a.lpfnWndProc = wc->lpfnWndProc;
-    a.cbClsExtra = wc->cbClsExtra;
-    a.cbWndExtra = wc->cbWndExtra;
-    a.hInstance = wc->hInstance;
-    a.hIcon = wc->hIcon;
-    a.hCursor = wc->hCursor;
-    a.hbrBackground = wc->hbrBackground;
-    a.lpszMenuName = NULL;
-    if (wc->lpszMenuName != NULL) {
-        NatWtoA(wc->lpszMenuName, menu, sizeof(menu));
-        a.lpszMenuName = menu;
-    }
-    NatWtoA(wc->lpszClassName, cls, sizeof(cls));
-    a.lpszClassName = cls;
-    a.hIconSm = wc->hIconSm;
-    return RegisterClassExA(&a);
-}
-
-static int NatDrawText(HDC dc, const WCHAR *text, int cch, RECT *rc, UINT fmt)
-{
-    char buf[NAT_ABUF];
-
-    (void)cch;
-    NatWtoA(text, buf, NAT_ABUF);
-    return DrawTextA(dc, buf, -1, rc, fmt);
-}
-
-static DWORD NatFormatMessage(DWORD flags, LPCVOID source, DWORD msgId,
-                              DWORD langId, LPWSTR buffer, DWORD size,
-                              va_list *args)
-{
-    LPSTR tmp = NULL;
-    DWORD r;
-
-    (void)size;
-    r = FormatMessageA((flags & ~FORMAT_MESSAGE_ALLOCATE_BUFFER) |
-                       FORMAT_MESSAGE_ALLOCATE_BUFFER,
-                       source, msgId, langId, (LPSTR)&tmp, 0, args);
-    if (r == 0 || tmp == NULL) {
-        if (buffer != NULL)
-            *(LPWSTR *)buffer = NULL;
-        return 0;
-    }
-    {
-        int wlen = MultiByteToWideChar(CP_ACP, 0, tmp, -1, NULL, 0);
-        LPWSTR w = NULL;
-
-        if (wlen > 0)
-            w = (LPWSTR)LocalAlloc(LPTR, (SIZE_T)wlen * sizeof(WCHAR));
-        if (w != NULL) {
-            MultiByteToWideChar(CP_ACP, 0, tmp, -1, w, wlen);
-            LocalFree(tmp);
-            *(LPWSTR *)buffer = w;
-            return (DWORD)(wlen - 1);
-        }
-    }
-    LocalFree(tmp);
-    if (buffer != NULL)
-        *(LPWSTR *)buffer = NULL;
-    return 0;
-}
-
-static LONG NatRegOpenKeyEx(HKEY key, const WCHAR *sub, DWORD options,
-                            REGSAM sam, PHKEY out)
-{
-    char buf[512];
-
-    NatWtoA(sub, buf, sizeof(buf));
-    return RegOpenKeyExA(key, buf, options, sam, out);
-}
-
-static LONG NatRegEnumKeyEx(HKEY key, DWORD index, WCHAR *name, LPDWORD cch,
-                            LPDWORD reserved, WCHAR *classBuf, LPDWORD classCch,
-                            void *lastWrite)
-{
-    char buf[256];
-    DWORD cb = (DWORD)sizeof(buf);
-    LONG r;
-
-    (void)classBuf;
-    (void)classCch;
-    (void)lastWrite;
-    r = RegEnumKeyExA(key, index, buf, &cb, reserved, NULL, NULL, NULL);
-    if (r == ERROR_SUCCESS) {
-        NatAtoW(buf, name, 128);
-        if (cch != NULL)
-            *cch = (DWORD)wcslen(name);
-    }
-    return r;
-}
-
-static LONG NatRegQueryValueEx(HKEY key, const WCHAR *name, LPDWORD reserved,
-                               LPDWORD type, LPBYTE data, LPDWORD cb)
-{
-    char nm[128];
-    BYTE tmp[1024];
-    DWORD cbTmp = (DWORD)sizeof(tmp);
-    LONG r;
-
-    NatWtoA(name, nm, sizeof(nm));
-    r = RegQueryValueExA(key, nm, reserved, type, tmp, &cbTmp);
-    if (r != ERROR_SUCCESS)
-        return r;
-    if ((*type == REG_SZ || *type == REG_MULTI_SZ) && cb != NULL) {
-        const char *p = (const char *)tmp;
-        const char *end = (const char *)tmp + cbTmp;
-        WCHAR w[512];
-        DWORD wused = 0;
-        DWORD bytes;
-
-        while (p < end && wused + 2 < (DWORD)(sizeof(w) / sizeof(w[0]))) {
-            int n = MultiByteToWideChar(CP_ACP, 0, p, -1, w + wused,
-                                        (int)((sizeof(w) / sizeof(w[0])) - wused));
-
-            if (n <= 0)
-                break;
-            wused += (DWORD)n;
-            p += strlen(p) + 1;
-        }
-        if (wused == 0)
-            w[wused++] = L'\0';
-        bytes = wused * (DWORD)sizeof(WCHAR);
-        if (bytes > *cb)
-            bytes = *cb;
-        memcpy(data, w, bytes);
-        *cb = bytes;
-    } else {
-        if (cbTmp > *cb)
-            cbTmp = *cb;
-        memcpy(data, tmp, cbTmp);
-        *cb = cbTmp;
-    }
-    return ERROR_SUCCESS;
-}
-
-/* LVITEMW/LVITEMV 与 A 版布局完全一致，只有 pszText 的字符宽度不同，
-   所以整体复制结构、再替换 pszText 指针即可。 */
-static LRESULT NatSendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg) {
-    case WM_SETTEXT:
-        {
-            char buf[NAT_ABUF];
-
-            NatWtoA((const WCHAR *)lParam, buf, NAT_ABUF);
-            return SendMessageA(hwnd, msg, wParam, (LPARAM)buf);
-        }
-    case WM_GETTEXT:
-        {
-            char buf[NAT_ABUF];
-
-            buf[0] = '\0';
-            SendMessageA(hwnd, msg, (WPARAM)NAT_ABUF, (LPARAM)buf);
-            NatAtoW(buf, (WCHAR *)lParam, (int)wParam);
-            return (LRESULT)wcslen((WCHAR *)lParam);
-        }
-    case CB_ADDSTRING:
-    case CB_INSERTSTRING:
-        {
-            char buf[NAT_ABUF];
-
-            NatWtoA((const WCHAR *)lParam, buf, NAT_ABUF);
-            return SendMessageA(hwnd, msg, wParam, (LPARAM)buf);
-        }
-    case CB_GETLBTEXT:
-        {
-            char buf[NAT_ABUF];
-            LRESULT r;
-
-            buf[0] = '\0';
-            r = SendMessageA(hwnd, msg, wParam, (LPARAM)buf);
-            NatAtoW(buf, (WCHAR *)lParam, 256);
-            return r;
-        }
-    case EM_REPLACESEL:
-        {
-            char buf[NAT_ABUF];
-
-            NatWtoA((const WCHAR *)lParam, buf, NAT_ABUF);
-            return SendMessageA(hwnd, msg, wParam, (LPARAM)buf);
-        }
-    case LVM_INSERTITEMW:
-    case LVM_SETITEMW:
-        {
-            const LVITEMW *iw = (const LVITEMW *)lParam;
-            LVITEMA ia;
-            char tb[1024];
-
-            ZeroMemory(&ia, sizeof(ia));
-            memcpy(&ia, iw, sizeof(ia));
-            tb[0] = '\0';
-            if (iw->pszText != NULL) {
-                NatWtoA(iw->pszText, tb, sizeof(tb));
-                ia.pszText = tb;
-            }
-            return SendMessageA(hwnd,
-                                msg == LVM_INSERTITEMW ? LVM_INSERTITEMA
-                                                       : LVM_SETITEMA,
-                                wParam, (LPARAM)&ia);
-        }
-    case LVM_GETITEMW:
-        {
-            LVITEMW *iw = (LVITEMW *)lParam;
-            LVITEMA ia;
-            char tb[1024];
-            LPWSTR dst = iw->pszText;
-            int dstCch = iw->cchTextMax;
-            LRESULT r;
-
-            ZeroMemory(&ia, sizeof(ia));
-            memcpy(&ia, iw, sizeof(ia));
-            tb[0] = '\0';
-            if (dst != NULL) {
-                ia.pszText = tb;
-                ia.cchTextMax = (int)sizeof(tb);
-            }
-            r = SendMessageA(hwnd, LVM_GETITEMA, wParam, (LPARAM)&ia);
-            /* 必须把 A 版回填的整块结构拷回去：只回填 pszText 的话，
-               lParam/state/iImage 全是调用方传进来的原值（通常是 0），
-               ListView_GetItem(LVIF_PARAM) 就永远拿到 NULL，列表项会被
-               RefreshList 当成野指针当场删掉——9x 上"加完映射列表空白"
-               就是这个原因。 */
-            memcpy(iw, &ia, sizeof(ia));
-            iw->pszText = dst;
-            iw->cchTextMax = dstCch;
-            if (dst != NULL)
-                NatAtoW(tb, dst, dstCch > 0 ? dstCch : 1024);
-            return r;
-        }
-    case LVM_SETITEMTEXTW:
-        {
-            const LVITEMW *iw = (const LVITEMW *)lParam;
-            LVITEMA ia;
-            char tb[1024];
-
-            ZeroMemory(&ia, sizeof(ia));
-            ia.iSubItem = iw->iSubItem;
-            tb[0] = '\0';
-            NatWtoA(iw->pszText, tb, sizeof(tb));
-            ia.pszText = tb;
-            return SendMessageA(hwnd, LVM_SETITEMTEXTA, wParam, (LPARAM)&ia);
-        }
-    case LVM_GETITEMTEXTW:
-        {
-            LVITEMW *iw = (LVITEMW *)lParam;
-            LVITEMA ia;
-            char tb[1024];
-            LRESULT r;
-
-            ZeroMemory(&ia, sizeof(ia));
-            ia.iSubItem = iw->iSubItem;
-            tb[0] = '\0';
-            ia.pszText = tb;
-            ia.cchTextMax = (int)sizeof(tb);
-            r = SendMessageA(hwnd, LVM_GETITEMTEXTA, wParam, (LPARAM)&ia);
-            if (iw->pszText != NULL)
-                NatAtoW(tb, iw->pszText, iw->cchTextMax > 0 ? iw->cchTextMax : 1024);
-            return r;
-        }
-    case LVM_INSERTCOLUMNW:
-    case LVM_SETCOLUMNW:
-        {
-            const LVCOLUMNW *cw = (const LVCOLUMNW *)lParam;
-            LVCOLUMNA ca;
-            char tb[256];
-
-            ZeroMemory(&ca, sizeof(ca));
-            memcpy(&ca, cw, sizeof(ca));
-            if (cw->pszText != NULL) {
-                tb[0] = '\0';
-                NatWtoA(cw->pszText, tb, sizeof(tb));
-                ca.pszText = tb;
-            }
-            return SendMessageA(hwnd,
-                                msg == LVM_INSERTCOLUMNW ? LVM_INSERTCOLUMNA
-                                                         : LVM_SETCOLUMNA,
-                                wParam, (LPARAM)&ca);
-        }
-    }
-    return SendMessageA(hwnd, msg, wParam, lParam);
-}
-
-#define SendMessageW            NatSendMessage
-#define SetWindowTextW          NatSetWindowText
-#define GetWindowTextW          NatGetWindowText
-#define GetWindowTextLengthW    NatGetWindowTextLength
-#define MessageBoxW             NatMessageBox
-#define CreateWindowExW         NatCreateWindowEx
-#define RegisterClassExW        NatRegisterClassEx
-#define DefWindowProcW          DefWindowProcA
-/* Win98 的 USER32 确实导出了 PostMessageW（所以 exe 能加载），但这个函数
-   投递出去的消息永远不会到达窗口过程——实测 PostMessageA 到达、
-   PostMessageW 不到达。日志唤醒、状态刷新都靠 PostMessage，9x 上必须走 A。 */
-#define PostMessageW            PostMessageA
-/* UNICODE 编译下 IDI_APPLICATION/IDC_ARROW 是 MAKEINTRESOURCEW，
-   直接传给 A 版函数类型不匹配，这里统一强转一次。 */
-#define LoadIconW(h, name)      LoadIconA((h), (LPCSTR)(name))
-#define LoadCursorW(h, name)    LoadCursorA((h), (LPCSTR)(name))
-#define CreateEventW            CreateEventA
-#define GetMessageW             GetMessageA
-#define IsDialogMessageW        IsDialogMessageA
-#define DispatchMessageW        DispatchMessageA
-#define DrawTextW               NatDrawText
-#define FormatMessageW          NatFormatMessage
-#define RegOpenKeyExW           NatRegOpenKeyEx
-#define RegEnumKeyExW           NatRegEnumKeyEx
-#define RegQueryValueExW        NatRegQueryValueEx
-
-#endif  /* NAT_ANSI */
 
 /* 三个构建各自的产品名：界面标题、窗口类名、User-Agent、UPnP 映射描述
    都取自这里，避免出现"改一处漏一处"。 */
-#if NAT_ANSI
-#  define NAT_PRODUCT       L"NAThelp9X"
-#  define NAT_PRODUCT_A     "NAThelp9X"
-#  define NAT_PLATFORM_NOTE L"本版本适用于 Windows 95+（95 / 98 / Me）。"
-#elif NAT_LEGACY
-#  define NAT_PRODUCT       L"NAThelp32"
-#  define NAT_PRODUCT_A     "NAThelp32"
-#  define NAT_PLATFORM_NOTE L"本版本适用于 Windows NT4 SP5+（32 位）。"
-#else
 #  define NAT_PRODUCT       L"NAThelper"
 #  define NAT_PRODUCT_A     "NAThelper"
 #  define NAT_PLATFORM_NOTE L"本版本适用于 Windows Vista x64+。"
-#endif
 
 #define APP_NAME            NAT_PRODUCT
-#define APP_VERSION         L"1.1.0"
+#define APP_VERSION         L"1.1.1"
 #define APP_TITLE           NAT_PRODUCT L" - NAT 穿透映射助手"
 
 #define NAT_WNDCLASS_MAIN   NAT_PRODUCT L"WindowClass"
@@ -618,6 +191,7 @@ static LRESULT NatSendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 #define IDC_BLACKCLEAR      1041
 #define IDC_BLACKRULELIST   1042
 #define IDC_BLACKSTATUS     1043
+#define IDC_BTTOGGLE        1044
 #define BLACK_TIMER_ID      3
 
 typedef enum _MAP_PROTO {
@@ -652,6 +226,7 @@ struct _TCP_CONN {
     USHORT local_port;          /* 映射的本地端口（写 PROXY 头用） */
     HANDLE thread;
     volatile LONG closing;
+    volatile LONG abortive;      /* 1 = 收尾时直接 RST，不发 FIN */
     int head_sent;          /* 等待注入的字节已全部发出 */
     char pending[512];
     int pending_len;
@@ -773,6 +348,9 @@ static HWND g_hwndBlackDel = NULL;
 static HWND g_hwndBlackClear = NULL;
 static HWND g_hwndBlackRuleList = NULL;
 static HWND g_hwndBlackStatus = NULL;
+/* BT 反吸血总开关：全局一份，主窗口按钮切换，改完立即对已建立连接生效 */
+static int g_btGuard = 0;
+static HWND g_hwndBtToggle = NULL;    /* 主窗口上的 BT 反吸血开关按钮 */
 
 static HFONT g_hFont = NULL;
 static int g_fontOwned = 0;
@@ -789,252 +367,13 @@ static volatile LONG g_totalTcpConns = 0; /* 全进程 TCP 中继线程总数上
 /* 基础工具                                                            */
 /* ------------------------------------------------------------------ */
 
-#if NAT_LEGACY
-/* NT4 的 msvcrt 不一定导出 _vsnwprintf；一旦缺这个导入，exe 在加载阶段
-   就会直接失败。所以 32 位构建改为运行期取地址，取不到就用下面的内置
-   格式化，覆盖本程序实际用到的转换符（d i u x X c s p f I64）。 */
-typedef int (__cdecl *NAT_VSNWPRINTF)(WCHAR *, size_t, const WCHAR *, va_list);
-
-static NAT_VSNWPRINTF g_vsnwprintf;
-static BOOL g_printfInit;
-
-static void WPutCh(WCHAR *buf, size_t cch, size_t *used, WCHAR c)
-{
-    if (*used + 1 < cch) {
-        buf[*used] = c;
-        ++*used;
-        buf[*used] = L'\0';
-    }
-}
-
-static int WIntToStr(WCHAR *out, ULONGLONG v, unsigned base, BOOL upper)
-{
-    static const WCHAR lowDigits[] = L"0123456789abcdef";
-    static const WCHAR upDigits[] = L"0123456789ABCDEF";
-    const WCHAR *digits = upper ? upDigits : lowDigits;
-    WCHAR tmp[24];
-    int n = 0;
-    int i;
-
-    do {
-        tmp[n++] = digits[(unsigned)(v % base)];
-        v /= base;
-    } while (v != 0);
-    for (i = 0; i < n; ++i)
-        out[i] = tmp[n - 1 - i];
-    out[n] = L'\0';
-    return n;
-}
-
-static void WEmitInt(WCHAR *buf, size_t cch, size_t *used, ULONGLONG mag,
-                     BOOL neg, unsigned base, BOOL upper,
-                     int width, BOOL zero, BOOL left)
-{
-    WCHAR num[24];
-    int n = WIntToStr(num, mag, base, upper);
-    int total = n + (neg ? 1 : 0);
-    int pad = (width > total) ? width - total : 0;
-    int i;
-
-    if (!left && zero) {
-        if (neg)
-            WPutCh(buf, cch, used, L'-');
-        for (i = 0; i < pad; ++i)
-            WPutCh(buf, cch, used, L'0');
-        for (i = 0; i < n; ++i)
-            WPutCh(buf, cch, used, num[i]);
-        return;
-    }
-    if (!left) {
-        for (i = 0; i < pad; ++i)
-            WPutCh(buf, cch, used, L' ');
-    }
-    if (neg)
-        WPutCh(buf, cch, used, L'-');
-    for (i = 0; i < n; ++i)
-        WPutCh(buf, cch, used, num[i]);
-    if (left) {
-        for (i = 0; i < pad; ++i)
-            WPutCh(buf, cch, used, L' ');
-    }
-}
-
-static void WEmitStr(WCHAR *buf, size_t cch, size_t *used, const WCHAR *s,
-                     int prec, int width, BOOL left)
-{
-    int len = 0;
-    int pad;
-    int i;
-
-    if (s == NULL)
-        s = L"(null)";
-    while (s[len] != L'\0' && (prec < 0 || len < prec))
-        ++len;
-    pad = (width > len) ? width - len : 0;
-    if (!left) {
-        for (i = 0; i < pad; ++i)
-            WPutCh(buf, cch, used, L' ');
-    }
-    for (i = 0; i < len; ++i)
-        WPutCh(buf, cch, used, s[i]);
-    if (left) {
-        for (i = 0; i < pad; ++i)
-            WPutCh(buf, cch, used, L' ');
-    }
-}
-
-static void WFormatV(WCHAR *buf, size_t cch, const WCHAR *fmt, va_list ap)
-{
-    size_t used = 0;
-    const WCHAR *p;
-
-    if (buf == NULL || cch == 0)
-        return;
-    buf[0] = L'\0';
-    if (fmt == NULL)
-        return;
-
-    for (p = fmt; *p != L'\0'; ++p) {
-        BOOL left = FALSE;
-        BOOL zero = FALSE;
-        BOOL is64 = FALSE;
-        int width = 0;
-        int prec = -1;
-        WCHAR conv;
-
-        if (*p != L'%') {
-            WPutCh(buf, cch, &used, *p);
-            continue;
-        }
-        ++p;
-        if (*p == L'%') {
-            WPutCh(buf, cch, &used, L'%');
-            continue;
-        }
-        for (;;) {
-            if (*p == L'-') {
-                left = TRUE;
-                ++p;
-            } else if (*p == L'0') {
-                zero = TRUE;
-                ++p;
-            } else {
-                break;
-            }
-        }
-        while (*p >= L'0' && *p <= L'9') {
-            width = width * 10 + (int)(*p - L'0');
-            ++p;
-        }
-        if (*p == L'.') {
-            ++p;
-            prec = 0;
-            while (*p >= L'0' && *p <= L'9') {
-                prec = prec * 10 + (int)(*p - L'0');
-                ++p;
-            }
-        }
-        if (p[0] == L'I' && p[1] == L'6' && p[2] == L'4') {
-            is64 = TRUE;
-            p += 3;
-        } else if (*p == L'l' || *p == L'h') {
-            ++p;
-        }
-        conv = *p;
-        if (conv == L'\0')
-            break;
-
-        switch (conv) {
-        case L'd':
-        case L'i': {
-            LONGLONG v = is64 ? va_arg(ap, LONGLONG)
-                              : (LONGLONG)va_arg(ap, int);
-            BOOL neg = (v < 0) ? TRUE : FALSE;
-            ULONGLONG mag = neg ? (ULONGLONG)(-(v + 1)) + 1 : (ULONGLONG)v;
-
-            WEmitInt(buf, cch, &used, mag, neg, 10, FALSE, width, zero, left);
-            break;
-        }
-        case L'u':
-        case L'x':
-        case L'X': {
-            ULONGLONG v = is64 ? va_arg(ap, ULONGLONG)
-                               : (ULONGLONG)va_arg(ap, unsigned int);
-
-            WEmitInt(buf, cch, &used, v, FALSE,
-                     (conv == L'u') ? 10u : 16u,
-                     (conv == L'X') ? TRUE : FALSE,
-                     width, zero, left);
-            break;
-        }
-        case L'p': {
-            ULONGLONG v = (ULONGLONG)(ULONG_PTR)va_arg(ap, void *);
-
-            WEmitInt(buf, cch, &used, v, FALSE, 16, TRUE,
-                     (width > 0) ? width : 8, TRUE, left);
-            break;
-        }
-        case L'f': {
-            char nb[80];
-            WCHAR wb[80];
-            double d = va_arg(ap, double);
-            int i;
-
-            _snprintf(nb, sizeof(nb), "%.*f", (prec < 0) ? 6 : prec, d);
-            nb[sizeof(nb) - 1] = '\0';
-            for (i = 0; i < (int)sizeof(wb) - 1 && nb[i] != '\0'; ++i)
-                wb[i] = (WCHAR)(unsigned char)nb[i];
-            wb[i] = L'\0';
-            WEmitStr(buf, cch, &used, wb, -1, width, left);
-            break;
-        }
-        case L'c': {
-            WCHAR cbuf[2];
-
-            cbuf[0] = (WCHAR)va_arg(ap, int);
-            cbuf[1] = L'\0';
-            WEmitStr(buf, cch, &used, cbuf, -1, width, left);
-            break;
-        }
-        case L's': {
-            const WCHAR *s = va_arg(ap, const WCHAR *);
-
-            WEmitStr(buf, cch, &used, s, prec, width, left);
-            break;
-        }
-        default:
-            WPutCh(buf, cch, &used, L'%');
-            WPutCh(buf, cch, &used, conv);
-            break;
-        }
-    }
-}
-#endif
 
 static void VWPrintf(WCHAR *buf, size_t cch, const WCHAR *fmt, va_list ap)
 {
     if (buf == NULL || cch == 0)
         return;
     buf[0] = L'\0';
-#if NAT_LEGACY
-    if (!g_printfInit) {
-        HMODULE hMod;
-
-        g_printfInit = TRUE;
-        hMod = GetModuleHandleA("msvcrt.dll");
-        if (hMod == NULL)
-            hMod = LoadLibraryA("msvcrt.dll");
-        if (hMod != NULL)
-            g_vsnwprintf = (NAT_VSNWPRINTF)(void *)
-                           GetProcAddress(hMod, "_vsnwprintf");
-    }
-    if (g_vsnwprintf != NULL)
-        g_vsnwprintf(buf, cch - 1, fmt, ap);
-    else
-        WFormatV(buf, cch, fmt, ap);
-#else
     _vsnwprintf(buf, cch - 1, fmt, ap);
-#endif
     buf[cch - 1] = L'\0';
 }
 
@@ -1047,37 +386,10 @@ static void WPrintf(WCHAR *buf, size_t cch, const WCHAR *fmt, ...)
     va_end(ap);
 }
 
-/* 单调毫秒时钟。64 位构建直接用 GetTickCount64；NT4 没有这个函数，
-   改用 GetTickCount 扩成 64 位，并处理 49.7 天一次的 32 位回绕。
-   所有调用点只做差值比较，基准从 0 起算不影响任何逻辑。 */
+/* 单调毫秒时钟。所有调用点只做差值比较，基准从 0 起算不影响任何逻辑。 */
 static ULONGLONG NowMs64(void)
 {
-#if NAT_LEGACY
-    static volatile LONG s_lock = 0;
-    static BOOL started = FALSE;
-    static DWORD last = 0;
-    static ULONGLONG base = 0;
-    DWORD t;
-    ULONGLONG r;
-
-    while (InterlockedCompareExchange(&s_lock, 1, 0) != 0)
-        Sleep(0);
-    t = GetTickCount();
-    if (!started) {
-        started = TRUE;
-        last = t;
-    } else if (t < last && (DWORD)(last - t) > 0x7FFFFFFFu) {
-        base += 0x100000000ULL;
-        last = t;
-    } else if (t >= last) {
-        last = t;
-    }
-    r = base + t;
-    InterlockedExchange(&s_lock, 0);
-    return r;
-#else
     return GetTickCount64();
-#endif
 }
 
 static unsigned int NextRand(void)
@@ -1387,21 +699,41 @@ static BOOL UpdatePublicAddress(NAT_MAPPING *m, const STUN_RESULT *r, WCHAR *add
 /* msvcrt 的 _vsnwprintf 不支持 %llu，用 %I64u 才能安全输出 64 位流量 */
 #define FMT_U64 L"%I64u"
 
-/* 自适应单位：不足 1KB 用 B，之后 KB/MB/GB/TB，数字始终控制在几个字符内，
-   列表列宽就不会被大流量撑爆或吞掉。 */
+/* 单位换算：整数部分 + 小数部分都用整数算，四舍五入，不碰浮点。
+   显示宽度固定，列表列宽不会被大流量撑爆。 */
+static void FormatScaled(WCHAR *buf, size_t cch, ULONGLONG v, ULONGLONG unit,
+                         int digits, const WCHAR *suffix)
+{
+    ULONGLONG whole = v / unit;
+    ULONGLONG rem = v % unit;
+    unsigned scale = (digits == 1) ? 10U : 100U;
+    unsigned frac = (unsigned)((rem * scale + unit / 2) / unit);
+
+    if (frac >= scale) {
+        frac -= scale;
+        ++whole;
+    }
+    if (digits == 1)
+        WPrintf(buf, cch, L"%I64u.%u %s", (unsigned long long)whole, frac, suffix);
+    else
+        WPrintf(buf, cch, L"%I64u.%02u %s", (unsigned long long)whole, frac, suffix);
+}
+
+/* 自适应单位：不足 1KB 用 B，之后 KB/MB/GB/TB。小数点用 L'.' 直接拼出来，
+   不经过 printf 的 %f —— 浮点输出的小数点由 C 运行库的 locale 决定，
+   个别环境会变成别的字符（用户反馈过两位数时 "." 变成 ":"）。 */
 static void FormatBytesW(WCHAR *buf, size_t cch, ULONGLONG v)
 {
     if (v < 1024ULL) {
         WPrintf(buf, cch, FMT_U64 L" B", (unsigned long long)v);
     } else if (v < 1024ULL * 1024ULL) {
-        WPrintf(buf, cch, L"%.1f KB", (double)v / 1024.0);
+        FormatScaled(buf, cch, v, 1024ULL, 1, L"KB");
     } else if (v < 1024ULL * 1024ULL * 1024ULL) {
-        WPrintf(buf, cch, L"%.2f MB", (double)v / (1024.0 * 1024.0));
+        FormatScaled(buf, cch, v, 1024ULL * 1024ULL, 2, L"MB");
     } else if (v < 1024ULL * 1024ULL * 1024ULL * 1024ULL) {
-        WPrintf(buf, cch, L"%.2f GB", (double)v / (1024.0 * 1024.0 * 1024.0));
+        FormatScaled(buf, cch, v, 1024ULL * 1024ULL * 1024ULL, 2, L"GB");
     } else {
-        WPrintf(buf, cch, L"%.2f TB",
-                (double)v / (1024.0 * 1024.0 * 1024.0 * 1024.0));
+        FormatScaled(buf, cch, v, 1024ULL * 1024ULL * 1024ULL * 1024ULL, 2, L"TB");
     }
 }
 
@@ -1489,34 +821,12 @@ static BOOL ParseStunEndpoint(const WCHAR *text, WCHAR *host, size_t hostCch,
     return TRUE;
 }
 
-/* 主机名/点分十进制 -> IPv4。64 位构建走 getaddrinfo；32 位兼容构建
-   没有 getaddrinfo（XP 起才有），退回 inet_addr + gethostbyname。
-   返回 0 表示成功，-2 表示解析到主机但没有 IPv4 地址，其余为错误码。 */
+/* 主机名/点分十进制 -> IPv4。返回 0 表示成功，-2 表示解析到主机但没有
+   IPv4 地址，其余为错误码。 */
 static int ResolveV4(const char *host, USHORT port, SOCKADDR_IN *out)
 {
     if (host == NULL || host[0] == '\0' || out == NULL)
         return -1;
-#if NAT_LEGACY
-    {
-        struct hostent *he;
-        unsigned long addr = inet_addr(host);
-
-        if (addr == INADDR_NONE) {
-            he = gethostbyname(host);
-            if (he == NULL)
-                return (int)WSAGetLastError();
-            if (he->h_addrtype != AF_INET || he->h_length != 4 ||
-                he->h_addr_list == NULL || he->h_addr_list[0] == NULL)
-                return -2;
-            memcpy(&addr, he->h_addr_list[0], 4);
-        }
-        ZeroMemory(out, sizeof(*out));
-        out->sin_family = AF_INET;
-        out->sin_addr.s_addr = addr;
-        out->sin_port = htons(port);
-        return 0;
-    }
-#else
     {
         ADDRINFOA hints;
         PADDRINFOA result = NULL;
@@ -1544,7 +854,6 @@ static int ResolveV4(const char *host, USHORT port, SOCKADDR_IN *out)
         freeaddrinfo(result);
         return 0;
     }
-#endif
 }
 
 static BOOL ResolveIPv4(const WCHAR *host, USHORT port, SOCKADDR_IN *out,
@@ -1914,15 +1223,10 @@ static SOCKET TcpBindPort(USHORT port, BOOL shared, WCHAR *err, size_t errCch)
         /* 独占端口：别的进程（包括本进程）再用 SO_REUSEADDR 也抢不走 */
         if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                        (const char *)&exclusive, sizeof(exclusive)) == SOCKET_ERROR) {
-#if NAT_LEGACY
-            /* NT4 SP5 的 winsock 支持这个选项；更老的实现不认它时，
-               端口独占性差一点，但绑定本身照常可用，不算失败。 */
-#else
             FormatWsaError(WSAGetLastError(), e, sizeof(e) / sizeof(e[0]));
             WPrintf(err, errCch, L"设置端口独占失败: %s", e);
             closesocket(s);
             return INVALID_SOCKET;
-#endif
         }
     } else {
         if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
@@ -2002,6 +1306,7 @@ typedef struct _BLACK_RULE {
     unsigned char lo[4];            /* 闭区间起点（网络序） */
     unsigned char hi[4];            /* 闭区间终点 */
     WCHAR text[BLACK_TEXT_CCH];     /* 用户输入原文，列表里原样显示 */
+    WCHAR note[BLACK_TEXT_CCH];     /* 备注：程序自动加的规则写明来源，手工规则为空 */
     unsigned long hits;             /* 命中次数（受 g_cs 保护） */
 } BLACK_RULE;
 
@@ -2267,6 +1572,247 @@ static BOOL BlacklistMatchAddress(const void *addr)
     }
     LeaveCriticalSection(&g_cs);
     return hit;
+}
+
+/* ------------------------------------------------------------------ */
+/* BT 反吸血（禁止同一 IP 重复连接）                                   */
+/* ------------------------------------------------------------------ */
+/* 判定口径：同一个对端 IP，只要同时保持 2 条及以上入站 TCP 连接，就认为
+   它在刷连接，把它整段封掉。只比 IP，不看端口：同一台机器换源端口重连、
+   或者同时连到两个映射端口，都算重复。
+   只统计本程序自己的入站 TCP 连接表（连接表窗口里那些），不去读系统
+   GetTcpTable：那里面全是别的程序的连接，浏览器、系统更新都能把计数刷上去。
+   两个触发时机：
+     1) accept 到新连接时先看这个 IP 是否已经连着，是就当场拒绝并封禁
+        （新连接检查模式）；
+     2) 每秒扫一遍连接表兜底，处理两条连接几乎同时 accept、当时还没挂进
+        链表的情况。
+   封禁 = 写一条 /32 规则（备注“BT反吸血程序封禁”）+ 立刻检查一次连接表，
+   把这个 IP 已经建立的连接全部 RST 掉，之后回落到只查新连接。 */
+
+#define BT_MAX_TRACK   32
+#define BT_MAX_PORTS   8
+#define BT_BAN_NOTE    L"BT反吸血程序封禁"
+
+typedef struct _BT_TRACK {
+    unsigned char ip[4];
+    USHORT ports[BT_MAX_PORTS];
+    int portCount;
+} BT_TRACK;
+
+/* 点分十进制。这一段刻意不依赖后面的 FormatIpv4W，保持自包含 */
+static void BtFormatIp(const unsigned char ip[4], WCHAR *buf, size_t cch)
+{
+    WPrintf(buf, cch, L"%u.%u.%u.%u",
+            (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3]);
+}
+
+/* 地址是否已经被某条规则覆盖；只查表，不计命中数 */
+static BOOL BlackRuleCovers(const unsigned char ip[4])
+{
+    int i;
+    BOOL hit = FALSE;
+
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_blackCount; ++i) {
+        if (memcmp(ip, g_black[i].lo, 4) >= 0 &&
+            memcmp(ip, g_black[i].hi, 4) <= 0) {
+            hit = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return hit;
+}
+
+/* 把 [lo,hi] 范围内已经建立的 TCP 连接立刻 RST 掉，返回断开的条数。
+   这是“规则刚建立时查一次连接表”的落地：每个连接都设 linger=0 再
+   shutdown，中继线程随后 closesocket 时发出去的就是 RST 而不是 FIN。
+   调用者不能持有 g_cs。 */
+static int RstConnectionsInRange(const unsigned char lo[4],
+                                 const unsigned char hi[4])
+{
+    NAT_MAPPING *m;
+    int killed = 0;
+
+    EnterCriticalSection(&g_cs);
+    for (m = g_maps; m != NULL; m = m->next) {
+        TCP_CONN *c;
+
+        for (c = m->conns; c != NULL; c = c->next) {
+            const unsigned char *p = (const unsigned char *)&c->peer_addr.sin_addr.s_addr;
+            struct linger lg;
+
+            if (memcmp(p, lo, 4) < 0 || memcmp(p, hi, 4) > 0)
+                continue;
+            if (c->client != INVALID_SOCKET) {
+                lg.l_onoff = 1;
+                lg.l_linger = 0;
+                setsockopt(c->client, SOL_SOCKET, SO_LINGER,
+                           (const char *)&lg, sizeof(lg));
+            }
+            /* 这里不 shutdown：shutdown 会先发一个 FIN，对方收到的是正常
+               关闭。只置标志，让中继线程带 linger=0 直接 close，才是 RST。 */
+            InterlockedExchange(&c->abortive, 1);
+            InterlockedExchange(&c->closing, 1);
+            ++killed;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return killed;
+}
+
+/* 封禁一个 IP：写一条 /32 规则（已被别的规则覆盖就不重复写），然后立刻
+   把它现有的连接全部 RST。返回 TRUE 表示这次真的写进去了。 */
+static BOOL BtBanIp(const unsigned char ip[4], const WCHAR *how)
+{
+    unsigned char lo[4];
+    unsigned char hi[4];
+    WCHAR text[32];
+    BOOL added = FALSE;
+    int killed;
+
+    memcpy(lo, ip, 4);
+    memcpy(hi, ip, 4);
+    BtFormatIp(ip, text, sizeof(text) / sizeof(text[0]));
+
+    EnterCriticalSection(&g_cs);
+    if (g_blackCount < BLACK_MAX_RULES) {
+        int i;
+        BOOL dup = FALSE;
+
+        for (i = 0; i < g_blackCount; ++i) {
+            if (memcmp(g_black[i].lo, lo, 4) >= 0 &&
+                memcmp(g_black[i].hi, hi, 4) <= 0) {
+                dup = TRUE;
+                break;
+            }
+        }
+        if (!dup) {
+            BLACK_RULE *r = &g_black[g_blackCount];
+
+            ZeroMemory(r, sizeof(*r));
+            memcpy(r->lo, lo, 4);
+            memcpy(r->hi, hi, 4);
+            CopyW(r->text, sizeof(r->text) / sizeof(r->text[0]), text);
+            CopyW(r->note, sizeof(r->note) / sizeof(r->note[0]), BT_BAN_NOTE);
+            ++g_blackCount;
+            InterlockedIncrement(&g_blackVersion);
+            added = TRUE;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    /* 规则一建立就扫一次连接表，把已经连着的立刻掐断 */
+    killed = RstConnectionsInRange(lo, hi);
+
+    if (added) {
+        if (how != NULL && how[0] != L'\0')
+            AddLog(L"BT 反吸血: %s %s，已封禁（备注：%s）",
+                   text, how, BT_BAN_NOTE);
+        else
+            AddLog(L"BT 反吸血: %s 同时存在多条入站连接，已封禁（备注：%s）",
+                   text, BT_BAN_NOTE);
+        if (killed > 0)
+            AddLog(L"黑名单规则已建立: %s，已立即 RST 掉 %d 条已建立连接",
+                   text, killed);
+    } else if (killed > 0) {
+        AddLog(L"黑名单规则 %s 命中 %d 条已建立连接，已立即 RST", text, killed);
+    }
+    return added;
+}
+
+/* 扫一遍连接表：同一 IP 出现在 >=2 个不同的（开了开关的）本地端口上就封禁。
+   每秒由主窗口定时器调用一次；没有开关端口时几乎不花时间。 */
+/* 扫一遍连接表：同一个 IP 同时挂着 >=2 条入站连接就封禁。
+   每秒由主窗口定时器调用一次；开关关着时一次循环都不进。 */
+static void BtGuardScanOnce(void)
+{
+    unsigned char ips[BT_MAX_TRACK][4];
+    int counts[BT_MAX_TRACK];
+    int trackCount = 0;
+    NAT_MAPPING *m;
+    BOOL enabled;
+    int i;
+
+    EnterCriticalSection(&g_cs);
+    enabled = g_btGuard ? TRUE : FALSE;
+    if (enabled) {
+        for (m = g_maps; m != NULL; m = m->next) {
+            TCP_CONN *c;
+
+            for (c = m->conns; c != NULL; c = c->next) {
+                const unsigned char *p =
+                    (const unsigned char *)&c->peer_addr.sin_addr.s_addr;
+                int found = -1;
+                int k;
+
+                if (InterlockedCompareExchange(&c->closing, 0, 0) != 0)
+                    continue;
+                for (k = 0; k < trackCount; ++k) {
+                    if (memcmp(ips[k], p, 4) == 0) {
+                        found = k;
+                        break;
+                    }
+                }
+                if (found < 0) {
+                    if (trackCount >= BT_MAX_TRACK)
+                        continue;
+                    found = trackCount++;
+                    memcpy(ips[found], p, 4);
+                    counts[found] = 0;
+                }
+                ++counts[found];
+            }
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (!enabled)
+        return;
+    for (i = 0; i < trackCount; ++i) {
+        if (counts[i] >= 2 && !BlackRuleCovers(ips[i]))
+            BtBanIp(ips[i], NULL);
+    }
+}
+
+/* accept 时的新连接检查：这个 IP 已经在别的开关端口上连着就直接拒绝。
+   命中会顺手封禁这个 IP（封禁里已经包含“把已建立连接 RST 掉”这一步）。 */
+/* accept 时的新连接检查：这个 IP 只要已经连着一条，就直接拒绝。
+   命中会顺手封禁这个 IP（封禁里已经包含“把已建立连接 RST 掉”这一步）。 */
+static BOOL BtGuardReject(const SOCKADDR_IN *peer)
+{
+    const unsigned char *ip = (const unsigned char *)&peer->sin_addr.s_addr;
+    unsigned char copy[4];
+    BOOL reject = FALSE;
+
+    EnterCriticalSection(&g_cs);
+    if (g_btGuard) {
+        NAT_MAPPING *x;
+
+        for (x = g_maps; x != NULL && !reject; x = x->next) {
+            TCP_CONN *c;
+
+            for (c = x->conns; c != NULL; c = c->next) {
+                const unsigned char *p =
+                    (const unsigned char *)&c->peer_addr.sin_addr.s_addr;
+
+                if (InterlockedCompareExchange(&c->closing, 0, 0) != 0)
+                    continue;
+                if (memcmp(p, ip, 4) == 0) {
+                    reject = TRUE;
+                    break;
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (reject) {
+        memcpy(copy, ip, 4);
+        BtBanIp(copy, L"已有连接又连入一条新连接");
+    }
+    return reject;
 }
 
 /* 保活连接：和监听 socket 共享同一个本地端口（SO_REUSEADDR），
@@ -2742,97 +2288,9 @@ static ULONG LocalAddressForDest(ULONG dest_net)
     return result;
 }
 
-#if NAT_LEGACY
-/* NT4 没有 iphlpapi.dll（GetBestRoute 是 2000 才有的），改从 TCP/IP 参数
-   注册表键里读默认网关。多网卡/VPN 时优先挑与本机同子网的那个，避免把
-   组播和单播探针发到错误的网卡上。 */
-static BOOL GatewayFromRegistry(ULONG preferred, ULONG *out)
-{
-    HKEY hk;
-    DWORD index;
-    BOOL found = FALSE;
-    ULONG first = 0;
-    WCHAR sub[256];
-
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces",
-                      0, KEY_READ, &hk) != ERROR_SUCCESS)
-        return FALSE;
-
-    for (index = 0; !found; ++index) {
-        DWORD cch = (DWORD)(sizeof(sub) / sizeof(sub[0]));
-        HKEY hsub;
-        static const WCHAR *const names[2] = {
-            L"DhcpDefaultGateway", L"DefaultGateway"
-        };
-        int n;
-
-        if (RegEnumKeyExW(hk, index, sub, &cch, NULL, NULL, NULL, NULL)
-                != ERROR_SUCCESS)
-            break;
-        if (RegOpenKeyExW(hk, sub, 0, KEY_READ, &hsub) != ERROR_SUCCESS)
-            continue;
-        for (n = 0; n < 2 && !found; ++n) {
-            BYTE data[512];
-            DWORD cb = (DWORD)sizeof(data);
-            DWORD type = 0;
-
-            if (RegQueryValueExW(hsub, names[n], NULL, &type, data, &cb)
-                    != ERROR_SUCCESS)
-                continue;
-            if (type != REG_MULTI_SZ && type != REG_SZ)
-                continue;
-            {
-                const WCHAR *p = (const WCHAR *)data;
-                const WCHAR *end = (const WCHAR *)(data + cb);
-
-                while (p < end && *p != L'\0') {
-                    char a[32];
-                    int k = 0;
-                    ULONG addr;
-
-                    while (k < (int)sizeof(a) - 1 && p[k] != L'\0') {
-                        a[k] = (char)p[k];
-                        ++k;
-                    }
-                    a[k] = '\0';
-                    addr = (ULONG)inet_addr(a);
-                    if (addr != INADDR_NONE && addr != 0) {
-                        if ((addr & 0xFFFFFF00UL) ==
-                            (preferred & 0xFFFFFF00UL)) {
-                            *out = addr;
-                            found = TRUE;
-                            break;
-                        }
-                        if (first == 0)
-                            first = addr;
-                    }
-                    p += k + 1;
-                }
-            }
-        }
-        RegCloseKey(hsub);
-    }
-    RegCloseKey(hk);
-    if (!found && first != 0) {
-        *out = first;
-        found = TRUE;
-    }
-    return found;
-}
-#endif
 
 static BOOL GetDefaultGatewayIPv4(ULONG dest_net, ULONG *out)
 {
-#if NAT_LEGACY
-    ULONG local;
-
-    if (out == NULL)
-        return FALSE;
-    *out = 0;
-    local = LocalAddressForDest(dest_net);
-    return GatewayFromRegistry(local, out);
-#else
     MIB_IPFORWARDROW row;
     DWORD rc;
 
@@ -2846,7 +2304,6 @@ static BOOL GetDefaultGatewayIPv4(ULONG dest_net, ULONG *out)
         return TRUE;
     }
     return FALSE;
-#endif
 }
 
 /* 只信任局域网内的 SSDP 响应：公网上任何人都能给 239.255.255.250 回包，
@@ -4889,7 +4346,10 @@ done:
             SOCKET s = conn->client;
 
             conn->client = INVALID_SOCKET;
-            shutdown(s, SD_BOTH);
+            /* abortive 时跳过 shutdown：先发 FIN 就成了正常关闭，
+               带 linger=0 的 closesocket 才会发 RST */
+            if (InterlockedCompareExchange(&conn->abortive, 0, 0) == 0)
+                shutdown(s, SD_BOTH);
             closesocket(s);
         }
         if (conn->backend != INVALID_SOCKET) {
@@ -5369,7 +4829,7 @@ static DWORD WINAPI TcpMappingThread(LPVOID param)
                 accepted++;
 
                 /* 黑名单只在这里查一次：命中立刻用 RST 断开，不建立中继线程。
-                   已建立的连接不受影响。 */
+                   已建立的连接不受影响——规则刚建立的那一刻例外，那时 RST 一次。 */
                 if (BlacklistMatchAddress(&peer.sin_addr)) {
                     blackRejected++;
                     if (lastBlackLog == 0 || now - lastBlackLog >= 5000) {
@@ -5381,6 +4841,18 @@ static DWORD WINAPI TcpMappingThread(LPVOID param)
                                m->name, peerText, blackRejected);
                         lastBlackLog = now;
                     }
+                    TcpPunchClose(&client);
+                    continue;
+                }
+
+                /* BT 反吸血：这个 IP 已经连着，当场拒绝并封禁 */
+                if (BtGuardReject(&peer)) {
+                    WCHAR peerText[64];
+
+                    FormatSockAddrW(&peer, peerText,
+                                    sizeof(peerText) / sizeof(peerText[0]));
+                    AddLog(L"[%s] TCP 入站 %s 触发 BT 反吸血，已回复 RST",
+                           m->name, peerText);
                     TcpPunchClose(&client);
                     continue;
                 }
@@ -5860,17 +5332,6 @@ static BOOL CALLBACK ApplyFontProc(HWND hwnd, LPARAM lParam)
 
 static void CreateFonts(HWND hwnd)
 {
-#if NAT_ANSI
-    NONCLIENTMETRICSA ncm;
-
-    ZeroMemory(&ncm, sizeof(ncm));
-    ncm.cbSize = sizeof(ncm);
-    if (SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
-        g_hFont = CreateFontIndirectA(&ncm.lfMessageFont);
-        if (g_hFont != NULL)
-            g_fontOwned = 1;
-    }
-#else
     NONCLIENTMETRICSW ncm;
 
     ZeroMemory(&ncm, sizeof(ncm));
@@ -5880,7 +5341,6 @@ static void CreateFonts(HWND hwnd)
         if (g_hFont != NULL)
             g_fontOwned = 1;
     }
-#endif
     if (g_hFont == NULL)
         g_hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     (void)hwnd;
@@ -5978,6 +5438,7 @@ static void CreateControls(HWND hwnd)
         L"服务端需同时开启；服务端只认文本头才勾 v1，否则不要勾",
         SS_LEFT, 0, IDC_PROXY_HINT, hwnd);
 
+
     g_hwndAdd = MakeControl(L"BUTTON", L"添加并启动",
         WS_TABSTOP | BS_DEFPUSHBUTTON, 0, IDC_ADD, hwnd);
     g_hwndAddHint = MakeControl(L"STATIC",
@@ -5997,6 +5458,8 @@ static void CreateControls(HWND hwnd)
     g_hwndConnTable = MakeControl(L"BUTTON", L"连接表", WS_TABSTOP, 0, IDC_CONNTABLE, hwnd);
     g_hwndBlackBtn = MakeControl(L"BUTTON", L"黑名单", WS_TABSTOP, 0, IDC_BLACKLIST, hwnd);
     g_hwndClearLog = MakeControl(L"BUTTON", L"清空日志", WS_TABSTOP, 0, IDC_CLEARLOG, hwnd);
+    g_hwndBtToggle = MakeControl(L"BUTTON", L"BT 反吸血：关", WS_TABSTOP, 0,
+                                 IDC_BTTOGGLE, hwnd);
 
     g_hwndLogLabel = MakeControl(L"STATIC", L"运行日志:", SS_LEFT, 0, IDC_LOGLABEL, hwnd);
     g_hwndLog = MakeControl(L"EDIT", L"",
@@ -6047,7 +5510,7 @@ static int CalcHintBoxHeight(HWND hwnd, int width)
 }
 
 /* 窗口内容高度超过可视高度时整体垂直滚动：g_scrollY 是当前偏移，
-   g_scrollShown 记录滚动条是否可见（不读窗口样式，9x 上少走一次 API）。 */
+   g_scrollShown 记录滚动条是否可见（不读窗口样式，省一次 API 调用）。 */
 static int g_scrollY = 0;
 static BOOL g_scrollShown = FALSE;
 
@@ -6115,7 +5578,7 @@ static int LayoutPass(HWND hwnd, int W, int H, int off)
     }
 
     if (!compact) {
-        groupH = 132;
+        groupH = 130;
         MoveWindow(g_hwndGroup, margin, y - off, W - 2 * margin, groupH, TRUE);
         MoveWindow(g_hwndProtoLabel, margin + 16, y + 24 - off, 38, 20, TRUE);
         MoveWindow(g_hwndProto, margin + 56, y + 20 - off, 84, 200, TRUE);
@@ -6138,13 +5601,14 @@ static int LayoutPass(HWND hwnd, int W, int H, int off)
         ShowWindow(g_hwndAddHint, SW_SHOW);
         ShowWindow(g_hwndProxyHint, SW_SHOW);
 
-        MoveWindow(g_hwndStart, margin, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndStop, margin + 108, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndDelete, margin + 216, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndStopAll, margin + 324, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndConnTable, margin + 432, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndBlackBtn, margin + 540, y + 144 - off, 100, 28, TRUE);
-        MoveWindow(g_hwndClearLog, margin + 648, y + 144 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndStart, margin, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndStop, margin + 108, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndDelete, margin + 216, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndStopAll, margin + 324, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndConnTable, margin + 432, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndBlackBtn, margin + 540, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndClearLog, margin + 648, y + 142 - off, 100, 28, TRUE);
+        MoveWindow(g_hwndBtToggle, margin + 756, y + 142 - off, 100, 28, TRUE);
         y += groupH + 12 + 34;
     } else {
         int x = margin + 16;
@@ -6154,7 +5618,7 @@ static int LayoutPass(HWND hwnd, int W, int H, int off)
         {
             int twoRow = ((W - 2 * margin) < 470) ? 1 : 0;
 
-            groupH = twoRow ? 198 : 168;
+            groupH = twoRow ? 200 : 170;
             MoveWindow(g_hwndGroup, margin, y - off, W - 2 * margin, groupH, TRUE);
         }
         (void)0;
@@ -6192,6 +5656,8 @@ static int LayoutPass(HWND hwnd, int W, int H, int off)
         MoveWindow(g_hwndConnTable, margin, y + 34 - off, bw, 28, TRUE);
         MoveWindow(g_hwndBlackBtn, margin + bw + 8, y + 34 - off, bw, 28, TRUE);
         MoveWindow(g_hwndClearLog, margin + 2 * (bw + 8), y + 34 - off,
+                   bw, 28, TRUE);
+        MoveWindow(g_hwndBtToggle, margin + 3 * (bw + 8), y + 34 - off,
                    bw, 28, TRUE);
         y += 70;
     }
@@ -6247,7 +5713,7 @@ static int LayoutPass(HWND hwnd, int W, int H, int off)
         extra = 0;
     for (i = 0; i < 8; ++i)
         ListView_SetColumnWidth(g_hwndList, i,
-                                baseWidths[i] + (i == 5 ? extra : 0));
+                                baseWidths[i] + (i == 6 ? extra : 0));
 
     return listTop + listH + 8 + 20 + logH;
 }
@@ -6576,6 +6042,25 @@ static void StopSelectedMapping(void)
         AddLog(L"停止超时: %s 的线程可能仍在退出，请稍后再试", m->name);
     RefreshList();
     UpdateStatusBar();
+}
+
+/* 切换全局 BT 反吸血开关：不重启任何映射，改完立刻做一次全表检查，
+   正在重复连接的 IP 当场被封禁。按钮文字跟着显示当前状态。 */
+static void ToggleBtGuard(void)
+{
+    int on;
+
+    EnterCriticalSection(&g_cs);
+    g_btGuard = g_btGuard ? 0 : 1;
+    on = g_btGuard;
+    LeaveCriticalSection(&g_cs);
+
+    if (g_hwndBtToggle != NULL)
+        SetWindowTextW(g_hwndBtToggle, on ? L"BT 反吸血：开" : L"BT 反吸血：关");
+    AddLog(L"BT 反吸血: 已%s（立即生效）", on ? L"开启" : L"关闭");
+    UpdateStatusBar();
+    if (on)
+        BtGuardScanOnce();
 }
 
 static void DeleteSelectedMapping(void)
@@ -7088,6 +6573,7 @@ typedef struct _BLACK_ROW {
     WCHAR text[BLACK_TEXT_CCH];
     WCHAR range[96];
     WCHAR hits[24];
+    WCHAR note[BLACK_TEXT_CCH];
 } BLACK_ROW;
 
 static void FormatIpv4W(const unsigned char *a, WCHAR *buf, size_t cch)
@@ -7186,6 +6672,7 @@ static void RefreshBlackList(void)
 
         ZeroMemory(row, sizeof(*row));
         CopyW(row->text, sizeof(row->text) / sizeof(row->text[0]), g_black[i].text);
+        CopyW(row->note, sizeof(row->note) / sizeof(row->note[0]), g_black[i].note);
         FormatBlackRangeW(g_black[i].lo, g_black[i].hi,
                           row->range, sizeof(row->range) / sizeof(row->range[0]));
         WPrintf(row->hits, sizeof(row->hits) / sizeof(row->hits[0]), L"%lu",
@@ -7212,6 +6699,7 @@ static void RefreshBlackList(void)
             ListView_InsertItem(g_hwndBlackRuleList, &item);
             SetSubItemText(g_hwndBlackRuleList, i, 1, rows[i].range);
             SetSubItemText(g_hwndBlackRuleList, i, 2, rows[i].hits);
+            SetSubItemText(g_hwndBlackRuleList, i, 3, rows[i].note);
         }
         if (top > 0 && top < n)
             ListView_EnsureVisible(g_hwndBlackRuleList, top, FALSE);
@@ -7221,6 +6709,7 @@ static void RefreshBlackList(void)
             SetSubItemText(g_hwndBlackRuleList, i, 0, rows[i].text);
             SetSubItemText(g_hwndBlackRuleList, i, 1, rows[i].range);
             SetSubItemText(g_hwndBlackRuleList, i, 2, rows[i].hits);
+            SetSubItemText(g_hwndBlackRuleList, i, 3, rows[i].note);
         }
     }
 
@@ -7238,18 +6727,20 @@ static void CreateBlackControls(HWND hwnd)
     struct {
         const WCHAR *name;
         int width;
-    } cols[3] = {
-        { L"规则", 220 },
-        { L"匹配范围", 360 },
-        { L"命中", 60 }
+    } cols[4] = {
+        { L"规则", 200 },
+        { L"匹配范围", 300 },
+        { L"命中", 60 },
+        { L"备注", 240 }
     };
     int i;
     LVCOLUMNW col;
 
     g_hwndBlackInfo = MakeControl(L"STATIC",
-        L"命中后：TCP 立即回 RST 断开，UDP 直接丢弃；只在连接建立时检查一次，已建立的连接不受影响。\r\n"
+        L"命中后：TCP 立即回 RST 断开，UDP 直接丢弃。规则刚建立时会检查一次连接表，"
+        L"把已建立的连接立刻 RST；之后只在新连接建立时检查。\r\n"
         L"规则写法：113.75.1.10  |  113.75.*.*  |  113.75  |  113.75.1.0/24  |  "
-        L"113.75.1.10-113.75.1.200",
+        L"113.75.1.10-113.75.1.200。备注为“BT反吸血程序封禁”的是程序自动加的。",
         SS_LEFT, 0, IDC_BLACKINFO, hwnd);
 
     g_hwndBlackEdit = MakeControl(L"EDIT", L"",
@@ -7271,7 +6762,7 @@ static void CreateBlackControls(HWND hwnd)
     ListView_SetExtendedListViewStyle(g_hwndBlackRuleList,
         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
 
-    for (i = 0; i < 3; ++i) {
+    for (i = 0; i < 4; ++i) {
         ZeroMemory(&col, sizeof(col));
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         col.pszText = (LPWSTR)cols[i].name;
@@ -7281,7 +6772,7 @@ static void CreateBlackControls(HWND hwnd)
     }
 
     g_hwndBlackStatus = MakeControl(L"STATIC",
-        L"输入规则后点“添加”，立即生效；已经建立的连接不会被断开。",
+        L"输入规则后点“添加”，立即生效：先 RST 掉该范围内已建立的连接，之后拦截新连接。",
         SS_LEFT, 0, IDC_BLACKSTATUS, hwnd);
 
     ApplyFonts(hwnd);
@@ -7328,13 +6819,15 @@ static void LayoutBlackControls(HWND hwnd)
     /* 窗口变窄时让“匹配范围”列先缩，避免出现横向滚动条把“命中”列挡掉 */
     {
         int listW = rc.right - 2 * margin;
-        int rangeW = listW - (200 + 70) - 6;
+        int rangeW = listW - (200 + 70 + 200) - 6;
 
-        if (rangeW < 140)
-            rangeW = 140;
+        if (rangeW < 120)
+            rangeW = 120;
         ListView_SetColumnWidth(g_hwndBlackRuleList, 0, 200);
         ListView_SetColumnWidth(g_hwndBlackRuleList, 1, rangeW);
         ListView_SetColumnWidth(g_hwndBlackRuleList, 2, 70);
+        ListView_SetColumnWidth(g_hwndBlackRuleList, 3,
+                                listW - 200 - rangeW - 70 - 4);
     }
 }
 
@@ -7400,7 +6893,20 @@ static void BlackAddFromUi(void)
     }
 
     SetWindowTextW(g_hwndBlackEdit, L"");
-    SetWindowTextW(g_hwndBlackStatus, L"已添加，立即生效（只影响之后建立的连接）");
+    {
+        int killed = RstConnectionsInRange(lo, hi);
+
+        if (killed > 0) {
+            WPrintf(msg, sizeof(msg) / sizeof(msg[0]),
+                    L"已添加：规则刚建立，已立即 RST 掉 %d 条已建立连接", killed);
+            AddLog(L"黑名单规则已建立: %s，已立即 RST 掉 %d 条已建立连接",
+                   text, killed);
+        } else {
+            WPrintf(msg, sizeof(msg) / sizeof(msg[0]),
+                    L"已添加，立即生效（当前没有已建立的连接需要断开）");
+        }
+        SetWindowTextW(g_hwndBlackStatus, msg);
+    }
     AddLog(L"黑名单新增规则: %s", text);
     RefreshBlackList();
     SetFocus(g_hwndBlackEdit);
@@ -7682,9 +7188,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_TIMER:
         if (wParam == APP_TIMER_ID) {
-            /* 兜底：万一某次 WM_APP_LOG 没投递成功（9x 上 PostMessageW
-               就是这种情况），每秒补搬一次日志队列，日志不会永久空白 */
+            /* 兜底：万一某次 WM_APP_LOG 没投递成功，每秒补搬一次日志队列，
+               日志不会永久空白 */
             DrainLogQueue();
+            /* BT 反吸血：每秒扫一次连接表，同一 IP 占多个开关端口就封禁 */
+            BtGuardScanOnce();
             RefreshList();
             UpdateStatusBar();
         }
@@ -7754,6 +7262,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case IDC_BLACKLIST:
             if (HIWORD(wParam) == BN_CLICKED)
                 ShowBlacklistWindow();
+            return 0;
+        case IDC_BTTOGGLE:
+            if (HIWORD(wParam) == BN_CLICKED)
+                ToggleBtGuard();
             return 0;
         case IDC_CLEARLOG:
             if (HIWORD(wParam) == BN_CLICKED)
@@ -7851,8 +7363,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     g_hInst = hInstance;
 
-    /* Win95 零售版没有 ws2_32.dll，只有 Winsock 1.1；NT4 SP4 之前也一样。
-       先按 2.2 要，失败再退 1.1，两个都失败才算没有网络栈。 */
+    /* 先按 Winsock 2.2 要，失败再退 1.1（老系统只带 1.1）；
+       两个都失败才算没有网络栈。 */
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0 &&
         WSAStartup(MAKEWORD(1, 1), &wsa) != 0) {
         MessageBoxW(NULL, L"Winsock 初始化失败", APP_NAME, MB_OK | MB_ICONERROR);
@@ -7861,28 +7373,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     ZeroMemory(&icc, sizeof(icc));
     icc.dwSize = sizeof(icc);
-#if NAT_LEGACY
-    /* NT4 自带的是 comctl32 4.0，没有 InitCommonControlsEx（4.71 起）。
-       静态调用会让 exe 在老系统上因缺导出而无法加载，所以运行期取地址：
-       新系统照常用 Ex，老系统退回 InitCommonControls。 */
-    {
-        HMODULE hCtl = LoadLibraryA("comctl32.dll");
-        BOOL (WINAPI *pInitEx)(const INITCOMMONCONTROLSEX *) = NULL;
-
-        if (hCtl != NULL)
-            pInitEx = (BOOL (WINAPI *)(const INITCOMMONCONTROLSEX *))(void *)
-                      GetProcAddress(hCtl, "InitCommonControlsEx");
-        if (pInitEx != NULL) {
-            icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
-            if (!pInitEx(&icc)) {
-                icc.dwICC = ICC_LISTVIEW_CLASSES;
-                pInitEx(&icc);
-            }
-        } else {
-            InitCommonControls();
-        }
-    }
-#else
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
     if (!InitCommonControlsEx(&icc)) {
         /* 没有 comctl32 v6 激活上下文时 ICC_STANDARD_CLASSES 会失败，
@@ -7890,7 +7380,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         icc.dwICC = ICC_LISTVIEW_CLASSES;
         InitCommonControlsEx(&icc);
     }
-#endif
 
     InitializeCriticalSection(&g_cs);
 
